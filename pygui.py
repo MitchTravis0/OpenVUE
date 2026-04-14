@@ -11,7 +11,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 class LaunchScreen(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Aivue Calibration")
+        self.setWindowTitle("OpenVUE Calibration")
         self.setFixedSize(600, 300)
         self.setStyleSheet("background-color: #16213e;")
 
@@ -19,7 +19,7 @@ class LaunchScreen(QWidget):
 
     def setup_ui(self):
         # Company name label
-        title = QLabel("Aivue")
+        title = QLabel("OpenVUE")
         title.setFont(QFont("Segoe UI", 32, QFont.Weight.Bold))
         title.setStyleSheet("color: white;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -63,10 +63,10 @@ class LaunchScreen(QWidget):
                 font-weight: 600;
             }
             QPushButton:hover {
-
                 border: 1px solid grey;
             }
         """)
+        settings_button.clicked.connect(self.open_settings)
 
         # Quit button send
         quit_button = QPushButton("Quit")
@@ -104,11 +104,14 @@ class LaunchScreen(QWidget):
 
         self.setLayout(layout)
 
+    def open_settings(self):
+        from settings_dialog import SettingsDialog
+        dialog = SettingsDialog(self)
+        dialog.exec()
+
     def run_script(self):
         self.showMinimized()
-        subprocess.run([sys.executable, "pyhandler.py"], check=True)
-        subprocess.run([sys.executable, "pipefacemac.py"], check=True)
-        subprocess.run([sys.executable, "STT.py"], check=True)
+        subprocess.Popen([sys.executable, "pyhandler.py"])
 
 
 if __name__ == "__main__":

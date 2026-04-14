@@ -22,8 +22,11 @@ keyboard = Controller()
 mouse = MouseController()
 held_keys = {}
 
-DEFAULT_SCREEN_WIDTH = 3024  # Default target resolution width
-DEFAULT_SCREEN_HEIGHT = 1964  # Default target resolution height
+try:
+    DEFAULT_SCREEN_WIDTH, DEFAULT_SCREEN_HEIGHT = pyautogui.size()
+except Exception:
+    DEFAULT_SCREEN_WIDTH = 1920
+    DEFAULT_SCREEN_HEIGHT = 1080
 
 KEY_MAP = {
     'enter': Key.enter,
@@ -36,9 +39,9 @@ KEY_MAP = {
     'down': Key.down,
     'left': Key.left,
     'right': Key.right,
-    'cmd': Key.cmd,           # macOS Command key
+    'cmd': Key.cmd,           # Cmd (macOS) / Win (Windows)
     'command': Key.cmd,
-    'option': Key.alt,        # macOS Option key maps to alt
+    'option': Key.alt,        # Option (macOS) / Alt (Windows)
     'alt': Key.alt,
     'shift': Key.shift,
     'delete': Key.delete,
@@ -79,7 +82,7 @@ def release_key(key):
 
 def open_application_via_search(app_name):
     """
-    A reliable way to open applications by using the Spotlight Search
+    Open applications using the system search (Spotlight on macOS, Start menu on Windows).
 
     Args:
         app_name: Name of the application to open (e.g., 'discord', 'chrome')
@@ -88,16 +91,23 @@ def open_application_via_search(app_name):
         True if the action sequence completed, False on error
     """
     try:
-        print(f"ACTION: Opening {app_name} via Windows search")
+        current_platform = system()
+        print(f"ACTION: Opening {app_name} via system search ({current_platform})")
 
-        # Open Spotlight search
-        hold_key(Key.cmd)  # NOT 'key.cmd' as a string
-        time.sleep(1)
-        hold_key(' ')  # spacebar
-        time.sleep(2)
-        release_key(Key.cmd)
-        time.sleep(1)
-        release_key(' ')
+        if current_platform == "Darwin":
+            # macOS Spotlight: Cmd+Space
+            hold_key(Key.cmd)
+            time.sleep(1)
+            hold_key(' ')
+            time.sleep(2)
+            release_key(Key.cmd)
+            time.sleep(1)
+            release_key(' ')
+        else:
+            # Windows Start menu search: press and release Win key
+            keyboard.press(Key.cmd)
+            keyboard.release(Key.cmd)
+            time.sleep(0.5)
 
         # Type the application name
         keyboard.type(app_name)
@@ -105,7 +115,7 @@ def open_application_via_search(app_name):
 
         # Press Enter to launch
         keyboard.press(Key.enter)
-        time.sleep(3)  # Wait for app to launch
+        time.sleep(3)
 
         print(f"Successfully initiated launch sequence for {app_name}")
         return True
@@ -217,9 +227,9 @@ def click_location(x, y):
         # Get screen size using pyautogui
         screen_width, screen_height = pyautogui.size()
 
-        # Safety check to avoid (0,0) unless it's inside Discord taskbar area
-        if (x == 0 and y == 0) and not (192 <= x <= 384 and y >= 1000):
-            print("Warning: Avoiding click at (0,0) which can trigger failsafe-like behavior")
+        # Safety check to avoid clicking at origin
+        if x == 0 and y == 0:
+            print("Warning: Avoiding click at (0,0)")
             x, y = screen_width // 2, screen_height - 40
             print(f"Using safer default position instead: ({x}, {y})")
 

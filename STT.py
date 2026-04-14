@@ -35,14 +35,31 @@ BLOCK_SIZE = 8000
 
 # --- Global Variables ---
 audio_queue = queue.Queue()
-result_queue = queue.Queue()
+result_queue = queue.Queue(maxsize=100)
 is_recording = False
+is_processing = False
 stream = None
 model = None
 recognizer = None  # For Vosk
 processing_thread = None
 typing_thread = None
 current_engine = None
+
+
+def _safe_queue_put(item):
+    """Put item into result_queue with overflow protection."""
+    try:
+        _safe_queue_put(item, block=False)
+    except queue.Full:
+        try:
+            result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            _safe_queue_put(item, block=False)
+        except queue.Full:
+            pass
+
 
 # --- Engine Loading ---
 
@@ -273,14 +290,16 @@ class OpenAIWhisperProcessor:
             self._transcribe_buffer()
 
         print("[STT] OpenAI whisper processing thread finished.")
-        result_queue.put(None)
+        _safe_queue_put(None)
 
     def _transcribe_buffer(self):
         """Transcribe the accumulated audio buffer"""
+        global is_processing
         if not self.audio_buffer:
             return
 
         try:
+            is_processing = True
             # Concatenate audio chunks
             audio_data = np.concatenate(self.audio_buffer, axis=0)
 
@@ -300,13 +319,15 @@ class OpenAIWhisperProcessor:
             if full_text:
                 # Filter common spurious outputs
                 if full_text.lower() not in ["the", "a", "um", "uh", ".", "you"]:
-                    result_queue.put(("final", full_text))
+                    _safe_queue_put(("final", full_text))
                     print(f"[STT] Transcribed: {full_text}")
 
         except Exception as e:
             import traceback
             print(f"[STT] Error transcribing audio: {e}")
             traceback.print_exc()
+        finally:
+            is_processing = False
 
 
 # --- whisper.cpp Processing ---
@@ -373,14 +394,16 @@ class WhisperCppProcessor:
             self._transcribe_buffer()
 
         print("[STT] whisper.cpp processing thread finished.")
-        result_queue.put(None)
+        _safe_queue_put(None)
 
     def _transcribe_buffer(self):
         """Transcribe the accumulated audio buffer"""
+        global is_processing
         if not self.audio_buffer:
             return
 
         try:
+            is_processing = True
             # Concatenate audio chunks
             audio_data = np.concatenate(self.audio_buffer, axis=0)
 
@@ -402,7 +425,7 @@ class WhisperCppProcessor:
                 spurious = ["the", "a", "um", "uh", ".", "you", "[music]", "(music)",
                            "[blank_audio]", "(blank_audio)", "blank_audio", "[silence]"]
                 if full_text.lower() not in spurious and not full_text.startswith("[") :
-                    result_queue.put(("final", full_text))
+                    _safe_queue_put(("final", full_text))
                     print(f"[STT] Transcribed: {full_text}")
                 else:
                     print(f"[STT] (filtered: {full_text})")
@@ -411,6 +434,8 @@ class WhisperCppProcessor:
             import traceback
             print(f"[STT] Error transcribing audio: {e}")
             traceback.print_exc()
+        finally:
+            is_processing = False
 
 
 # --- faster-whisper Processing ---
@@ -477,14 +502,16 @@ class FasterWhisperProcessor:
             self._transcribe_buffer()
 
         print("faster-whisper processing thread finished.")
-        result_queue.put(None)
+        _safe_queue_put(None)
 
     def _transcribe_buffer(self):
         """Transcribe the accumulated audio buffer"""
+        global is_processing
         if not self.audio_buffer:
             return
 
         try:
+            is_processing = True
             # Concatenate audio chunks
             audio_data = np.concatenate(self.audio_buffer, axis=0)
 
@@ -513,11 +540,13 @@ class FasterWhisperProcessor:
             if full_text:
                 # Filter common spurious outputs
                 if full_text.lower() not in ["the", "a", "um", "uh", "."]:
-                    result_queue.put(("final", full_text))
+                    _safe_queue_put(("final", full_text))
                     print(f"Transcribed: {full_text}")
 
         except Exception as e:
             print(f"Error transcribing audio: {e}")
+        finally:
+            is_processing = False
 
 
 # --- Vosk Processing ---
@@ -555,14 +584,14 @@ class VoskProcessor:
                     if final_text.lower() == "the":
                         print("Filtered spurious 'the'")
                     elif final_text:
-                        result_queue.put(("final", final_text))
+                        _safe_queue_put(("final", final_text))
                         print(f"Final: {final_text}")
                 else:
                     partial_json = self.recognizer.PartialResult()
                     partial_dict = json.loads(partial_json)
                     partial_text = partial_dict.get('partial', '')
                     if partial_text:
-                        result_queue.put(("partial", partial_text))
+                        _safe_queue_put(("partial", partial_text))
 
             except queue.Empty:
                 continue
@@ -583,13 +612,13 @@ class VoskProcessor:
                 if final_text.lower() == "the":
                     print("Filtered final 'the'")
                 elif final_text:
-                    result_queue.put(("final", final_text))
+                    _safe_queue_put(("final", final_text))
                     print(f"Final (at end): {final_text}")
         except Exception as e:
             print(f"Error getting final result: {e}")
 
         print("Vosk processing thread finished.")
-        result_queue.put(None)
+        _safe_queue_put(None)
 
 
 # --- Typing Thread ---

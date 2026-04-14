@@ -4,7 +4,7 @@ import subprocess
 import psutil
 import time
 import cv2
-import action_exectuor_mac
+import action_executor
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,12 +25,12 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QCursor
 
-from pipefacemac import HeadGazeTracker
-from STT import (toggle_recording, initialize_model, is_recording, result_queue)
+from headtracker import HeadGazeTracker
+from STT import (toggle_recording, initialize_model, is_recording, is_processing, result_queue)
 
 # --- Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PIPEFACE_SCRIPT = os.path.join(SCRIPT_DIR, "pipefacemac.py")  # CHANGE PATH
+PIPEFACE_SCRIPT = os.path.join(SCRIPT_DIR, "headtracker.py")
 PYGUI_SCRIPT = os.path.join(SCRIPT_DIR, "pygui.py")  # CHANGE PATH
 PYTHON_EXECUTABLE = sys.executable
 
@@ -204,9 +204,15 @@ class AssistWidget(QDialog):
     def _capture_stt_results(self):
         """Background thread to capture STT results and update input field."""
         import queue as q
+        from STT import is_processing as stt_is_processing
 
         while self.is_listening and not self.is_running:
             try:
+                # Show processing indicator while STT is transcribing
+                import STT
+                if STT.is_processing:
+                    self.status_label.setText("Processing speech...")
+
                 item = result_queue.get(timeout=0.1)
                 if item is None:
                     continue
@@ -221,6 +227,7 @@ class AssistWidget(QDialog):
                     current = self.input.text()
                     new_text = f"{current} {text}".strip() if current else text
                     self.input.setText(new_text)
+                    self.status_label.setText("Listening...")
                     print(f"[AssistWidget] Captured: {text}")
 
             except q.Empty:
@@ -294,7 +301,7 @@ class AssistWidget(QDialog):
                     except:
                         pass
 
-                result = action_exectuor_mac.digest_prompts(message, on_status=status_callback)
+                result = action_executor.digest_prompts(message, on_status=status_callback)
 
                 # Update UI on completion
                 success = result.get('success', False)
@@ -347,7 +354,7 @@ class ProcessControlApp(QWidget):
 
     def __init__(self):
         super().__init__()
-        # psutil handle for pipefacemac.py
+        # psutil handle for headtracker.py
         self.pipeface_process: psutil.Process | None = None
         self.is_paused = False
         self.is_hidden = True  # Start hidden
@@ -662,7 +669,7 @@ class ProcessControlApp(QWidget):
         print("Assist widget closed")
 
     def _is_pipeface_running(self) -> bool:
-        """Checks if the managed pipefacemac.py process is running."""
+        """Checks if the managed headtracker.py process is running."""
         if self.pipeface_process:
             try:
                 return self.pipeface_process.is_running()
@@ -675,7 +682,7 @@ class ProcessControlApp(QWidget):
         return False
 
     def _start_pipeface(self) -> bool:
-        """Starts or restarts the pipefacemac.py script using psutil."""
+        """Starts or restarts the headtracker.py script using psutil."""
         if not os.path.exists(PIPEFACE_SCRIPT):
             print(f"Error: Script not found at {PIPEFACE_SCRIPT}")
             QMessageBox.warning(
@@ -683,7 +690,7 @@ class ProcessControlApp(QWidget):
             return False
 
         if self._is_pipeface_running():
-            print("Terminating existing pipefacemac.py before restart.")
+            print("Terminating existing headtracker.py before restart.")
             self._terminate_process(self.pipeface_process)
 
         try:
@@ -698,7 +705,7 @@ class ProcessControlApp(QWidget):
             self.is_paused = False
             self.btn_pause.setText("Pause")
             print(
-                f"Started pipefacemac.py with PID: {self.pipeface_process.pid}")
+                f"Started headtracker.py with PID: {self.pipeface_process.pid}")
             return True
         except Exception as e:
             print(f"Error starting {PIPEFACE_SCRIPT}: {e}")
@@ -708,9 +715,9 @@ class ProcessControlApp(QWidget):
             return False
 
     def _toggle_pause_resume(self):
-        """Pauses or resumes the pipefacemac.py script via psutil."""
+        """Pauses or resumes the headtracker.py script via psutil."""
         if not self._is_pipeface_running():
-            print("Cannot pause/resume: pipefacemac.py is not running.")
+            print("Cannot pause/resume: headtracker.py is not running.")
             return
 
         try:
@@ -734,17 +741,17 @@ class ProcessControlApp(QWidget):
             self.btn_pause.setText("Pause" if not self.is_paused else "Resume")
 
     def _recall_pipeface(self):
-        """Terminates and restarts the pipefacemac.py script."""
+        """Terminates and restarts the headtracker.py script."""
         print("Recall requested...")
         if self._is_pipeface_running():
-            print("Terminating existing pipefacemac.py process...")
+            print("Terminating existing headtracker.py process...")
             if self._terminate_process(self.pipeface_process):
                 time.sleep(0.5)  # Brief pause before restart
             else:
                 print(
                     "Failed to terminate existing process cleanly, attempting restart anyway.")
         else:
-            print("pipefacemac.py was not running. Starting it now.")
+            print("headtracker.py was not running. Starting it now.")
 
         self._start_pipeface()
 
@@ -818,8 +825,7 @@ class ProcessControlApp(QWidget):
         self._terminate_process(self.pipeface_process)
 
         # Find and kill any other instances of target scripts
-        tracker.stop_tracking()  # Signal the tracker to stop
-        # tracker_thread.join()    # Wait for the tracker to finish cleanup
+        # Tracker cleanup handled by _terminate_process above
         scripts_to_kill = []
         if os.path.exists(PIPEFACE_SCRIPT):
             scripts_to_kill.append(PIPEFACE_SCRIPT)
@@ -860,9 +866,9 @@ if __name__ == '__main__':
     # Optional: Basic check if the primary controlled script exists
     if not os.path.exists(PIPEFACE_SCRIPT):
         print(
-            f"WARNING: Script 'pipefacemac.py' not found at {PIPEFACE_SCRIPT}. Recall/Pause will fail.")
+            f"WARNING: Script 'headtracker.py' not found at {PIPEFACE_SCRIPT}. Recall/Pause will fail.")
         # Consider exiting if critical:
-        # QMessageBox.critical(None, "Startup Error", f"Required script 'pipefacemac.py' not found.\n{PIPEFACE_SCRIPT}")
+        # QMessageBox.critical(None, "Startup Error", f"Required script 'headtracker.py' not found.\n{PIPEFACE_SCRIPT}")
         # sys.exit(1)
 
     app = QApplication(sys.argv)

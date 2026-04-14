@@ -89,11 +89,19 @@ class SafetyConfig:
         default_factory=lambda: [(0, 0, 5, 5)]  # Top-left corner
     )
 
-    # Keywords that trigger confirmation
-    sensitive_keywords: List[str] = field(
+    # Regex patterns that trigger confirmation for destructive commands
+    sensitive_patterns: List[str] = field(
         default_factory=lambda: [
-            "delete", "remove", "uninstall", "format",
-            "sudo", "rm -rf", "shutdown", "restart"
+            r"\brm\s+-rf\b",
+            r"\bdel\s+/[sfq]",
+            r"\bformat\s+[a-z]:",
+            r"\bshutdown\b",
+            r"\brestart\b",
+            r"\brmdir\s+/s",
+            r"\bdiskpart\b",
+            r"\breg\s+delete\b",
+            r"\bsudo\b",
+            r"\buninstall\b",
         ]
     )
 
@@ -133,12 +141,13 @@ class SafetyChecker:
                 if rx <= x <= rx + rw and ry <= y <= ry + rh:
                     return False, f"Coordinate ({x}, {y}) in restricted region"
 
-        # Check text for sensitive commands
+        # Check text for sensitive command patterns
         if action_type == "type":
+            import re
             text = action.get("text", "").lower()
-            for keyword in self.config.sensitive_keywords:
-                if keyword in text:
-                    return False, f"Sensitive command detected: {keyword}"
+            for pattern in self.config.sensitive_patterns:
+                if re.search(pattern, text):
+                    return False, f"Sensitive command pattern matched: {pattern}"
 
         return True, "OK"
 
@@ -637,28 +646,55 @@ For the current task, work step by step and complete it efficiently."""
             if self.on_iteration:
                 self.on_iteration(iterations, self.config.max_iterations)
 
-            try:
-                response = self.client.beta.messages.create(
-                    model=self.config.model,
-                    max_tokens=self.config.max_tokens,
-                    system=system_prompt,
-                    messages=messages,
-                    tools=tools,
-                    betas=[self.config.beta_flag]
-                )
-            except anthropic.APIError as e:
-                error_msg = f"API error: {e}"
-                print(error_msg)
-
-                if self.on_task_complete:
-                    self.on_task_complete(False, error_msg)
-
-                return {
-                    "success": False,
-                    "message": error_msg,
-                    "iterations": iterations,
-                    "actions_taken": actions_taken
-                }
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.beta.messages.create(
+                        model=self.config.model,
+                        max_tokens=self.config.max_tokens,
+                        system=system_prompt,
+                        messages=messages,
+                        tools=tools,
+                        betas=[self.config.beta_flag]
+                    )
+                    break
+                except anthropic.RateLimitError:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        print(f"Rate limited, retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        error_msg = "Rate limit exceeded after retries"
+                        print(error_msg)
+                        if self.on_task_complete:
+                            self.on_task_complete(False, error_msg)
+                        return {
+                            "success": False, "message": error_msg,
+                            "iterations": iterations, "actions_taken": actions_taken
+                        }
+                except anthropic.APIConnectionError:
+                    if attempt < max_retries - 1:
+                        print(f"Connection error, retrying in 1s...")
+                        time.sleep(1)
+                    else:
+                        error_msg = "API connection failed after retries"
+                        print(error_msg)
+                        if self.on_task_complete:
+                            self.on_task_complete(False, error_msg)
+                        return {
+                            "success": False, "message": error_msg,
+                            "iterations": iterations, "actions_taken": actions_taken
+                        }
+                except anthropic.APIError as e:
+                    error_msg = f"API error: {e}"
+                    print(error_msg)
+                    if self.on_task_complete:
+                        self.on_task_complete(False, error_msg)
+                    return {
+                        "success": False, "message": error_msg,
+                        "iterations": iterations, "actions_taken": actions_taken
+                    }
 
             # Add assistant response to conversation
             messages.append({
