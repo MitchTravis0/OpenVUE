@@ -109,7 +109,7 @@ Many people with conditions like ALS, paralysis, limited motor control, or other
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/OpenVUE.git
+   git clone https://github.com/MitchTravis0/OpenVUE.git
    cd OpenVUE
    ```
 
