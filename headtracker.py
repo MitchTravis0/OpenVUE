@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 import subprocess
 from tarfile import TruncatedHeaderError
+from urllib.request import urlretrieve
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 import pyautogui
 import time
@@ -13,6 +16,37 @@ import sys
 import platform
 import traceback
 from logger import log_event
+
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
+FACE_LANDMARKER_MODEL_FILENAME = "face_landmarker.task"
+
+
+def _resolve_face_landmarker_model() -> str:
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(repo_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    model_path = os.path.join(models_dir, FACE_LANDMARKER_MODEL_FILENAME)
+    if not os.path.exists(model_path):
+        print(f"Downloading FaceLandmarker model to {model_path}...")
+        tmp_path = model_path + ".part"
+        try:
+            urlretrieve(FACE_LANDMARKER_MODEL_URL, tmp_path)
+            os.replace(tmp_path, model_path)
+            print("FaceLandmarker model downloaded.")
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f"Failed to download FaceLandmarker model from "
+                f"{FACE_LANDMARKER_MODEL_URL}: {e}"
+            ) from e
+    return model_path
 
 try:
     from OneEuroFilter import OneEuroFilter
@@ -46,14 +80,25 @@ class HeadGazeTracker:
         else:
             print(f"{platform.system()} detected.")
 
-        # Initialize MediaPipe Face Mesh
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=self.config.mediapipe_detection_confidence,
-            min_tracking_confidence=self.config.mediapipe_tracking_confidence
+        # Initialize MediaPipe FaceLandmarker (Tasks API).
+        # VIDEO running mode preserves the temporal-tracking behavior the legacy
+        # FaceMesh provided via min_tracking_confidence. The 478-landmark schema
+        # (including iris 468-477) is identical to refine_landmarks=True FaceMesh.
+        self._face_landmarker_model_path = _resolve_face_landmarker_model()
+        self._face_landmarker_options = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_tasks.BaseOptions(
+                model_asset_path=self._face_landmarker_model_path
+            ),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=self.config.mediapipe_detection_confidence,
+            min_face_presence_confidence=self.config.mediapipe_detection_confidence,
+            min_tracking_confidence=self.config.mediapipe_tracking_confidence,
         )
+        self.face_landmarker = mp_vision.FaceLandmarker.create_from_options(
+            self._face_landmarker_options
+        )
+        self._last_landmarker_timestamp_ms = -1
 
         # Eye landmarks for EAR
         self.LEFT_EYE_V = [159, 145]
@@ -66,7 +111,11 @@ class HeadGazeTracker:
         self.RIGHT_IRIS = [473, 474, 475, 476, 477]
         self.LEFT_EYE_CORNERS = [33, 133]   # outer, inner
         self.RIGHT_EYE_CORNERS = [362, 263]
-        self.gaze_enabled = True
+        # Gaze-region jump is off by default: without a dedicated gaze
+        # calibration, iris direction noise causes the cursor to snap between
+        # regions and fight the head-pose cursor. Toggle at runtime with 'g'
+        # or set TrackingConfig.gaze_jump_enabled=True to enable by default.
+        self.gaze_enabled = getattr(self.config, "gaze_jump_enabled", False)
         self.gaze_jump_threshold = 0.25     # normalized gaze shift to trigger jump
         self.gaze_smoothing = 0.7           # EMA factor for gaze position
         self._smooth_gaze_x = 0.5
@@ -195,18 +244,25 @@ class HeadGazeTracker:
         self.scroll_direction = 0           # -1=up, 1=down, 0=none
         self.scroll_base_speed = 3          # scroll clicks per frame
 
-        # --- Raw Pose Smoothing (One Euro Filter) ---
+        # --- Raw Pose Smoothing (simple EMA; factor from config) ---
         self.smooth_yaw = 0.0
         self.smooth_pitch = 0.0
-        if OneEuroFilter is not None:
-            self.yaw_filter = OneEuroFilter(freq=30.0, min_cutoff=self.config.one_euro_min_cutoff, beta=self.config.one_euro_beta, d_cutoff=1.0)
-            self.pitch_filter = OneEuroFilter(freq=30.0, min_cutoff=self.config.one_euro_min_cutoff, beta=self.config.one_euro_beta, d_cutoff=1.0)
-        else:
-            self.yaw_filter = None
-            self.pitch_filter = None
         self.first_pose = True
 
         print("Initialization complete.")
+
+    def _detect_landmarks(self, frame_rgb):
+        """Run FaceLandmarker on an RGB frame, returning the detection result.
+
+        VIDEO mode requires strictly increasing timestamps, so we clamp using
+        monotonic wall-clock and a +1ms guard against duplicates.
+        """
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        ts_ms = int(time.monotonic() * 1000)
+        if ts_ms <= self._last_landmarker_timestamp_ms:
+            ts_ms = self._last_landmarker_timestamp_ms + 1
+        self._last_landmarker_timestamp_ms = ts_ms
+        return self.face_landmarker.detect_for_video(mp_image, ts_ms)
 
     def _calculate_distance(self, p1, p2):
         if p1 is None or p2 is None:
@@ -304,8 +360,14 @@ class HeadGazeTracker:
         return left_ear, right_ear
 
     def _get_head_pose(self, landmarks, image_shape):
-        """Main head pose method - delegates to solvePnP with geometric fallback."""
-        return self._get_head_pose_pnp(landmarks, image_shape)
+        """Main head pose method. Defaults to geometric (AIVue-compatible).
+        PnP is available opt-in via TrackingConfig.use_pnp_pose — it produces
+        more physically accurate angles but depends on approximate camera
+        intrinsics and tends to regress vertical responsiveness.
+        """
+        if getattr(self.config, "use_pnp_pose", False):
+            return self._get_head_pose_pnp(landmarks, image_shape)
+        return self._get_head_pose_geometric(landmarks, image_shape)
 
     def _get_head_pose_pnp(self, landmarks, image_shape):
         """Head pose estimation using cv2.solvePnP for robust 3D pose recovery."""
@@ -412,23 +474,21 @@ class HeadGazeTracker:
                     self.smooth_pitch if not self.first_pose else ref_pose[1])
 
     def _apply_pose_smoothing(self, head_yaw, head_pitch):
-        """Apply One Euro Filter (or EMA fallback) smoothing to raw pose values."""
+        """AIVue-style EMA smoothing on raw pose values. Factor is configurable
+        via TrackingConfig.pose_smoothing_factor (default 0.6 — original AIVue).
+        Higher factor = smoother and slower; lower = snappier.
+        """
         if self.first_pose:
-            if OneEuroFilter is not None:
-                self.yaw_filter = OneEuroFilter(freq=30.0, min_cutoff=self.config.one_euro_min_cutoff, beta=self.config.one_euro_beta, d_cutoff=1.0)
-                self.pitch_filter = OneEuroFilter(freq=30.0, min_cutoff=self.config.one_euro_min_cutoff, beta=self.config.one_euro_beta, d_cutoff=1.0)
+            self.smooth_yaw = head_yaw
+            self.smooth_pitch = head_pitch
             self._prev_rvec = None
             self._prev_tvec = None
             self.first_pose = False
+            return self.smooth_yaw, self.smooth_pitch
 
-        if self.yaw_filter is not None and self.pitch_filter is not None:
-            self.smooth_yaw = self.yaw_filter(head_yaw)
-            self.smooth_pitch = self.pitch_filter(head_pitch)
-        else:
-            alpha = 0.4
-            self.smooth_yaw = alpha * self.smooth_yaw + (1 - alpha) * head_yaw
-            self.smooth_pitch = alpha * self.smooth_pitch + (1 - alpha) * head_pitch
-
+        alpha = getattr(self.config, "pose_smoothing_factor", 0.6)
+        self.smooth_yaw = alpha * self.smooth_yaw + (1 - alpha) * head_yaw
+        self.smooth_pitch = alpha * self.smooth_pitch + (1 - alpha) * head_pitch
         return self.smooth_yaw, self.smooth_pitch
 
     def _estimate_gaze(self, landmarks, image_shape):
@@ -705,7 +765,7 @@ class HeadGazeTracker:
             frame = cv2.flip(frame, 1)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_rgb.flags.writeable = False
-            results = self.face_mesh.process(frame_rgb)
+            results = self._detect_landmarks(frame_rgb)
             frame.flags.writeable = True
 
             progress_fraction = min(1.0, (time.time() - start_time) / collection_duration)
@@ -717,8 +777,8 @@ class HeadGazeTracker:
                                         progress_fraction, remaining_time, is_neutral=True)
             cv2.imshow(calib_win_name, calib_img)
 
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
+            if results.face_landmarks:
+                landmarks = results.face_landmarks[0]
                 try:
                     head_yaw, head_pitch = self._get_head_pose(landmarks, frame.shape)
                     if baseline_pose is None:
@@ -783,7 +843,7 @@ class HeadGazeTracker:
                 frame = cv2.flip(frame, 1)
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_rgb.flags.writeable = False
-                results = self.face_mesh.process(frame_rgb)
+                results = self._detect_landmarks(frame_rgb)
                 frame.flags.writeable = True
 
                 progress_fraction = min(1.0, (time.time() - start_time) / collection_duration_point)
@@ -795,8 +855,8 @@ class HeadGazeTracker:
                                             progress_fraction, remaining_time)
                 cv2.imshow(calib_win_name, point_img)
 
-                if results.multi_face_landmarks:
-                    landmarks = results.multi_face_landmarks[0].landmark
+                if results.face_landmarks:
+                    landmarks = results.face_landmarks[0]
                     try:
                         head_yaw, head_pitch = self._get_head_pose(landmarks, frame.shape)
                         if baseline_pose is None:
@@ -1118,19 +1178,21 @@ class HeadGazeTracker:
         screen_x = screen_x_ratio * self.screen_width
         screen_y = screen_y_ratio * self.screen_height
 
-        # Apply acceleration curve: small movements stay precise, large movements amplified
-        center_x = self.screen_width / 2
-        center_y = self.screen_height / 2
-        dx = screen_x - center_x
-        dy = screen_y - center_y
-        distance = math.sqrt(dx*dx + dy*dy)
-        max_distance = math.sqrt(center_x**2 + center_y**2)
-        if distance > 0 and max_distance > 0:
-            normalized = distance / max_distance
-            accelerated = normalized ** self.config.acceleration_exponent
-            scale = accelerated / normalized
-            screen_x = center_x + dx * scale
-            screen_y = center_y + dy * scale
+        # Optional acceleration curve — skipped at exponent=1.0 (linear, AIVue-compatible).
+        accel = getattr(self.config, "acceleration_exponent", 1.0)
+        if accel != 1.0:
+            center_x = self.screen_width / 2
+            center_y = self.screen_height / 2
+            dx = screen_x - center_x
+            dy = screen_y - center_y
+            distance = math.sqrt(dx*dx + dy*dy)
+            max_distance = math.sqrt(center_x**2 + center_y**2)
+            if distance > 0 and max_distance > 0:
+                normalized = distance / max_distance
+                accelerated = normalized ** accel
+                scale = accelerated / normalized
+                screen_x = center_x + dx * scale
+                screen_y = center_y + dy * scale
 
         margin = 1
         screen_x = max(margin, min(self.screen_width - 1 - margin, screen_x))
@@ -1267,7 +1329,7 @@ class HeadGazeTracker:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_rgb.flags.writeable = False
             try:
-                results = self.face_mesh.process(frame_rgb)
+                results = self._detect_landmarks(frame_rgb)
             except Exception as e:
                 print(f"MediaPipe Error: {e}")
                 frame.flags.writeable = True
@@ -1276,8 +1338,8 @@ class HeadGazeTracker:
 
             left_ear, right_ear = 0.3, 0.3
 
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
+            if results.face_landmarks:
+                landmarks = results.face_landmarks[0]
                 try:
                     head_yaw, head_pitch = self._get_head_pose(
                         landmarks, frame.shape)
@@ -1321,11 +1383,15 @@ class HeadGazeTracker:
                     self.kf.Q[2, 2] = self.kf.Q[3, 3] = q_block_half[1, 1]
                     self.kf.Q[0, 2] = self.kf.Q[2, 0] = q_block_half[0, 1]
                     self.kf.Q[1, 3] = self.kf.Q[3, 1] = q_block_half[0, 1]
-                    # Adaptive measurement noise: trust measurements more during fast movement
-                    velocity = math.sqrt(self.kf.x[2, 0]**2 + self.kf.x[3, 0]**2)
-                    R_base = self.config.kalman_base_r
-                    R_adaptive = max(100.0, R_base / (1.0 + velocity * 0.015))
-                    self.kf.R = np.diag([R_adaptive, R_adaptive])
+                    # Measurement noise: constant (AIVue-compatible) unless
+                    # kalman_adaptive_r is explicitly enabled.
+                    if getattr(self.config, "kalman_adaptive_r", False):
+                        velocity = math.sqrt(self.kf.x[2, 0]**2 + self.kf.x[3, 0]**2)
+                        R_base = self.config.kalman_base_r
+                        R = max(100.0, R_base / (1.0 + velocity * 0.015))
+                    else:
+                        R = self.config.kalman_base_r
+                    self.kf.R = np.diag([R, R])
                     self.kf.predict()
                     self.kf.update(measurement)
                     filtered_x = self.kf.x[0, 0]
@@ -1335,12 +1401,13 @@ class HeadGazeTracker:
                         self.screen_width - 1 - margin, filtered_x))
                     smooth_y = max(margin, min(
                         self.screen_height - 1 - margin, filtered_y))
-                    # Dead zone: skip move if delta is below threshold to prevent micro-jitter
-                    current_x, current_y = pyautogui.position()
-                    dx = smooth_x - current_x
-                    dy = smooth_y - current_y
-                    if math.sqrt(dx*dx + dy*dy) < self.dead_zone_pixels:
-                        smooth_x, smooth_y = current_x, current_y
+                    # Dead zone: only applied when explicitly configured > 0.
+                    if self.dead_zone_pixels > 0:
+                        current_x, current_y = pyautogui.position()
+                        dx = smooth_x - current_x
+                        dy = smooth_y - current_y
+                        if math.sqrt(dx*dx + dy*dy) < self.dead_zone_pixels:
+                            smooth_x, smooth_y = current_x, current_y
                     try:
                         pyautogui.moveTo(smooth_x, smooth_y, duration=0.0)
                     except Exception as e:
@@ -1419,13 +1486,11 @@ class HeadGazeTracker:
             # Periodic MediaPipe reset to prevent landmark drift during long sessions
             if total_frame_count % self.mediapipe_reset_interval == 0:
                 print("Periodic MediaPipe reset...")
-                self.face_mesh.close()
-                self.face_mesh = self.mp_face_mesh.FaceMesh(
-                    max_num_faces=1,
-                    refine_landmarks=True,
-                    min_detection_confidence=self.config.mediapipe_detection_confidence,
-                    min_tracking_confidence=self.config.mediapipe_tracking_confidence
+                self.face_landmarker.close()
+                self.face_landmarker = mp_vision.FaceLandmarker.create_from_options(
+                    self._face_landmarker_options
                 )
+                self._last_landmarker_timestamp_ms = -1
             if time.time() - fps_start_time >= 1.0:
                 fps = frame_count / (time.time() - fps_start_time)
                 frame_count = 0
@@ -1471,8 +1536,8 @@ class HeadGazeTracker:
                     self.first_pose = True
             elif key == ord('r'):
                 # Quick re-center: snap reference to current pose without full recalibration
-                if results.multi_face_landmarks:
-                    landmarks = results.multi_face_landmarks[0].landmark
+                if results.face_landmarks:
+                    landmarks = results.face_landmarks[0]
                     current_yaw, current_pitch = self._get_head_pose(landmarks, frame.shape)
                     self.reference_head_pose = (current_yaw, current_pitch)
                     self.first_pose = True

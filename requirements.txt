@@ -19,7 +19,10 @@ pillow>=10.0.0
 screeninfo>=0.8.1
 
 # Speech-to-Text
+# pywhispercpp is the preferred engine (no PyTorch / ctranslate2 deps).
+# faster-whisper and vosk are fallback engines.
 sounddevice>=0.5.0
+pywhispercpp>=1.4.1
 vosk>=0.3.44
 faster-whisper>=1.0.0
 

@@ -14,15 +14,19 @@ SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
 @dataclass
 class TrackingConfig:
     camera_index: int = 1
-    dead_zone_pixels: int = 8
+    dead_zone_pixels: int = 0
     click_mode: str = "wink"  # "wink" or "dwell"
     dwell_time: float = 1.0
     dwell_tolerance: int = 15
-    acceleration_exponent: float = 0.7
+    acceleration_exponent: float = 1.0
     mediapipe_detection_confidence: float = 0.5
     mediapipe_tracking_confidence: float = 0.55
     mediapipe_reset_minutes: int = 5
-    kalman_base_r: float = 400.0
+    kalman_base_r: float = 900.0
+    kalman_adaptive_r: bool = False
+    pose_smoothing_factor: float = 0.6
+    use_pnp_pose: bool = False
+    gaze_jump_enabled: bool = False
     one_euro_min_cutoff: float = 1.0
     one_euro_beta: float = 0.007
 
